@@ -1,0 +1,29 @@
+# Covers both concord/ (frontend) and server/ (backend) since they're
+# expected to live in one repo at this root.
+
+node_modules/
+dist/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+
+.DS_Store
+*.pem
+npm-debug.log*
+
+.env*
+!.env*.example
+.vercel
+
+*.db
+*.sqlite
+*.sqlite3
+
+# personal working notes — not part of the portfolio-facing repo
+personal.md
+
+# agent config/instructions files, not part of the portfolio-facing repo
+CLAUDE.md
+AGENTS.md
