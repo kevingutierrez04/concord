@@ -3,7 +3,7 @@
 import { useDocSocket } from "@/lib/useDocSocket";
 
 export default function Home() {
-  const { content, edit, connected } = useDocSocket();
+  const { content, edit, connected, textareaRef } = useDocSocket();
 
   return (
     <div className="flex min-h-screen flex-col items-center bg-zinc-50 font-sans dark:bg-black">
@@ -28,6 +28,7 @@ export default function Home() {
           </span>
         </div>
         <textarea
+          ref={textareaRef}
           value={content}
           onChange={(e) => edit(e.target.value)}
           placeholder="Start typing... open this page in another tab to see it sync."

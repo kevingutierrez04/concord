@@ -1,13 +1,10 @@
 import { WebSocketServer, type WebSocket } from "ws";
-import type { ClientMessage, DocState, ServerMessage } from "./protocol.js";
+import { RGA } from "../../crdt/src/rga.js";
+import type { ClientMessage, ServerMessage } from "./protocol.js";
 
 const PORT = Number(process.env.PORT ?? 4001);
 
-let doc: DocState = {
-  content: "",
-  updatedAt: 0,
-  updatedBy: "server",
-};
+const doc = new RGA("server");
 
 const wss = new WebSocketServer({ port: PORT });
 const clients = new Set<WebSocket>();
@@ -26,7 +23,7 @@ function broadcast(message: ServerMessage, exclude?: WebSocket) {
 
 wss.on("connection", (ws) => {
   clients.add(ws);
-  send(ws, { type: "init", doc });
+  send(ws, { type: "snapshot", ops: doc.exportOps() });
 
   ws.on("message", (raw) => {
     let message: ClientMessage;
@@ -36,25 +33,12 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (message.type !== "update") return;
+    if (message.type !== "ops") return;
 
-    // Newer timestamp wins; equal timestamps break the tie on clientId.
-    const isNewer =
-      message.timestamp > doc.updatedAt ||
-      (message.timestamp === doc.updatedAt && message.clientId > doc.updatedBy);
-
-    if (!isNewer) {
-      // Sender lost the race — send it back the authoritative doc.
-      send(ws, { type: "init", doc });
-      return;
+    for (const op of message.ops) {
+      doc.applyOp(op);
     }
-
-    doc = {
-      content: message.content,
-      updatedAt: message.timestamp,
-      updatedBy: message.clientId,
-    };
-    broadcast({ type: "update", doc }, ws);
+    broadcast({ type: "ops", ops: message.ops }, ws);
   });
 
   ws.on("close", () => {

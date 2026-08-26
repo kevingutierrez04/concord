@@ -1,16 +1,10 @@
-export interface DocState {
-  content: string;
-  updatedAt: number;
-  updatedBy: string;
-}
+import type { Op } from "../../crdt/src/rga";
 
 export type ClientMessage = {
-  type: "update";
-  content: string;
-  clientId: string;
-  timestamp: number;
+  type: "ops";
+  ops: Op[];
 };
 
 export type ServerMessage =
-  | { type: "init"; doc: DocState }
-  | { type: "update"; doc: DocState };
+  | { type: "snapshot"; ops: Op[] }
+  | { type: "ops"; ops: Op[] };
