@@ -59,6 +59,42 @@ describe("visibleIndexOf", () => {
   });
 });
 
+describe("cursor anchors", () => {
+  it("round-trips a caret index through anchorAt/indexOfAnchor", () => {
+    const doc = new RGA("a");
+    doc.insertAt(0, "hello");
+    for (let i = 0; i <= 5; i++) {
+      expect(doc.indexOfAnchor(doc.anchorAt(i))).toBe(i);
+    }
+  });
+
+  it("keeps a caret in place when a remote edit lands before it", () => {
+    const a = new RGA("a");
+    const b = new RGA("b");
+    for (const op of a.insertAt(0, "world")) b.applyOp(op);
+
+    const anchor = a.anchorAt(2); // caret between "wo" and "rld"
+    for (const op of b.insertAt(0, "hello ")) a.applyOp(op);
+
+    expect(a.indexOfAnchor(anchor)).toBe(8); // still between "wo" and "rld"
+  });
+
+  it("resolves a deleted anchor to where the character used to be", () => {
+    const doc = new RGA("a");
+    doc.insertAt(0, "abcd");
+    const anchor = doc.anchorAt(3); // after "c"
+    doc.deleteAt(2, 1); // delete "c"
+    expect(doc.indexOfAnchor(anchor)).toBe(2);
+  });
+
+  it("returns null for an anchor whose insert hasn't arrived yet", () => {
+    const a = new RGA("a");
+    const ops = a.insertAt(0, "x");
+    const b = new RGA("b");
+    expect(b.indexOfAnchor(ops[0].id)).toBeNull();
+  });
+});
+
 describe("convergence across replicas", () => {
   it("converges when two replicas make concurrent inserts at the same position", () => {
     const a = new RGA("a");

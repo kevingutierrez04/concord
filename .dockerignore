@@ -1,0 +1,9 @@
+**/node_modules
+**/dist
+**/.next
+concord
+.git
+personal.md
+*.db
+*.db-wal
+*.db-shm

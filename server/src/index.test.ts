@@ -1,0 +1,285 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import WebSocket from "ws";
+import { RGA, type Op } from "../../crdt/src/rga.js";
+import { createServer, type ServerOptions } from "./index.js";
+import { SqliteOpLog } from "./persistence.js";
+import type { PresenceState, ServerMessage } from "./protocol.js";
+
+async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+function makeClient(port: number, siteId: string, wsOptions?: WebSocket.ClientOptions) {
+  const rga = new RGA(siteId);
+  const ws = new WebSocket(`ws://localhost:${port}`, wsOptions);
+  const messages: ServerMessage[] = [];
+
+  ws.on("message", (raw) => {
+    const msg = JSON.parse(raw.toString()) as ServerMessage;
+    messages.push(msg);
+    if (msg.type === "snapshot" || msg.type === "ops") {
+      for (const op of msg.ops) rga.applyOp(op);
+    }
+  });
+
+  const opened = new Promise<void>((resolve) => ws.once("open", () => resolve()));
+
+  return {
+    rga,
+    ws,
+    opened,
+    messages,
+    send(ops: Op[]) {
+      ws.send(JSON.stringify({ type: "ops", ops }));
+    },
+    sendPresence(state: PresenceState) {
+      ws.send(JSON.stringify({ type: "presence", clientId: siteId, state }));
+    },
+  };
+}
+
+const closers: (() => void)[] = [];
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  while (closers.length) closers.pop()!();
+  while (tempDirs.length) rmSync(tempDirs.pop()!, { recursive: true, force: true });
+});
+
+function startTestServer(options?: ServerOptions) {
+  const server = createServer(0, options);
+  const port = (server.wss.address() as AddressInfo).port;
+  closers.push(server.close);
+  return { port, doc: server.doc, close: server.close };
+}
+
+function tempDbPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), "concord-test-"));
+  tempDirs.push(dir);
+  return join(dir, "test.db");
+}
+
+describe("multi-client sync over the real server", () => {
+  it("converges after concurrent inserts at the same position from two clients", async () => {
+    const { port, doc } = startTestServer();
+    const a = makeClient(port, "a");
+    const b = makeClient(port, "b");
+    await Promise.all([a.opened, b.opened]);
+
+    a.send(a.rga.insertAt(0, "Hello "));
+    b.send(b.rga.insertAt(0, "World "));
+
+    await waitUntil(() => a.rga.getText() === b.rga.getText() && a.rga.getText().length > 0);
+    expect(a.rga.getText()).toBe(b.rga.getText());
+    expect(doc.getText()).toBe(a.rga.getText());
+  });
+
+  it("converges with a concurrent delete on one client and insert on another", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    const b = makeClient(port, "b");
+    await Promise.all([a.opened, b.opened]);
+
+    a.send(a.rga.insertAt(0, "hello"));
+    await waitUntil(() => b.rga.getText() === "hello");
+
+    const deleteOps = a.rga.deleteAt(0, 2);
+    const insertOps = b.rga.insertAt(b.rga.getText().length, "!");
+    a.send(deleteOps);
+    b.send(insertOps);
+
+    await waitUntil(() => a.rga.getText() === b.rga.getText() && a.rga.getText().includes("!"));
+    expect(a.rga.getText()).toBe("llo!");
+    expect(b.rga.getText()).toBe("llo!");
+  });
+
+  it("bootstraps a late-joining client with the full existing document", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    await a.opened;
+    a.send(a.rga.insertAt(0, "existing text"));
+    await waitUntil(() => a.rga.getText() === "existing text");
+
+    const c = makeClient(port, "c");
+    await c.opened;
+    await waitUntil(() => c.rga.getText() === "existing text");
+  });
+
+  it("relays ops to other clients but never echoes them back to the sender", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    const b = makeClient(port, "b");
+    await Promise.all([a.opened, b.opened]);
+
+    a.send(a.rga.insertAt(0, "x"));
+    await waitUntil(() => b.rga.getText() === "x");
+
+    expect(a.messages.filter((m) => m.type === "ops")).toHaveLength(0);
+  });
+});
+
+describe("presence", () => {
+  const state = (name: string): PresenceState => ({ name, color: "#ff0000", anchor: null });
+
+  it("relays a client's presence to others but not back to itself", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    const b = makeClient(port, "b");
+    await Promise.all([a.opened, b.opened]);
+
+    a.sendPresence(state("Ann"));
+    await waitUntil(() => b.messages.some((m) => m.type === "presence"));
+
+    const relayed = b.messages.find((m) => m.type === "presence");
+    expect(relayed).toMatchObject({ clientId: "a", state: { name: "Ann" } });
+    expect(a.messages.some((m) => m.type === "presence")).toBe(false);
+  });
+
+  it("tells a late joiner who is already present", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    await a.opened;
+    a.sendPresence(state("Ann"));
+    await new Promise((r) => setTimeout(r, 50));
+
+    const b = makeClient(port, "b");
+    await b.opened;
+    await waitUntil(() => b.messages.some((m) => m.type === "presences"));
+
+    const list = b.messages.find((m) => m.type === "presences");
+    expect(list).toMatchObject({ users: [{ clientId: "a", state: { name: "Ann" } }] });
+  });
+
+  it("announces when a client leaves", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    const b = makeClient(port, "b");
+    await Promise.all([a.opened, b.opened]);
+
+    a.sendPresence(state("Ann"));
+    await waitUntil(() => b.messages.some((m) => m.type === "presence"));
+    a.ws.close();
+
+    await waitUntil(() => b.messages.some((m) => m.type === "presence-leave"));
+    expect(b.messages.find((m) => m.type === "presence-leave")).toMatchObject({ clientId: "a" });
+  });
+
+  it("sanitizes untrusted name and color fields", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    const b = makeClient(port, "b");
+    await Promise.all([a.opened, b.opened]);
+
+    a.ws.send(
+      JSON.stringify({
+        type: "presence",
+        clientId: "a",
+        state: { name: "x".repeat(200), color: "red; background:url(x)", anchor: null },
+      })
+    );
+    await waitUntil(() => b.messages.some((m) => m.type === "presence"));
+
+    const relayed = b.messages.find((m) => m.type === "presence");
+    if (relayed?.type !== "presence") throw new Error("unreachable");
+    expect(relayed.state.name).toHaveLength(32);
+    expect(relayed.state.color).toBe("#888888");
+  });
+
+  it("never persists or replays presence as document state", async () => {
+    const { port, doc } = startTestServer();
+    const a = makeClient(port, "a");
+    await a.opened;
+    a.sendPresence(state("Ann"));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(doc.getText()).toBe("");
+  });
+});
+
+describe("heartbeat", () => {
+  it("terminates a peer that stops answering pings", async () => {
+    const { port } = startTestServer({ heartbeatMs: 50 });
+    const a = makeClient(port, "a", { autoPong: false });
+    await a.opened;
+
+    const closed = new Promise<void>((resolve) => a.ws.once("close", () => resolve()));
+    await Promise.race([
+      closed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("never terminated")), 1000)),
+    ]);
+  });
+
+  it("keeps a healthy peer connected", async () => {
+    const { port } = startTestServer({ heartbeatMs: 50 });
+    const a = makeClient(port, "a");
+    await a.opened;
+
+    await new Promise((r) => setTimeout(r, 300));
+    expect(a.ws.readyState).toBe(WebSocket.OPEN);
+  });
+});
+
+describe("persistence", () => {
+  it("restores the document after a server restart", async () => {
+    const dbPath = tempDbPath();
+
+    const first = startTestServer({ store: new SqliteOpLog(dbPath) });
+    const a = makeClient(first.port, "a");
+    await a.opened;
+    a.send(a.rga.insertAt(0, "durable text"));
+    a.send(a.rga.deleteAt(0, 8)); // "durable " -> "text"
+    await waitUntil(() => first.doc.getText() === "text");
+    a.ws.close();
+    first.close();
+
+    const second = startTestServer({ store: new SqliteOpLog(dbPath) });
+    expect(second.doc.getText()).toBe("text");
+
+    const b = makeClient(second.port, "b");
+    await b.opened;
+    await waitUntil(() => b.rga.getText() === "text");
+  });
+
+  it("lets a restored server keep merging edits that build on pre-restart state", async () => {
+    const dbPath = tempDbPath();
+
+    const first = startTestServer({ store: new SqliteOpLog(dbPath) });
+    const a = makeClient(first.port, "a");
+    await a.opened;
+    a.send(a.rga.insertAt(0, "hello"));
+    await waitUntil(() => first.doc.getText() === "hello");
+    first.close();
+
+    // A brand-new replica reusing site id "a" must bump its counter past the
+    // ids in the snapshot, then edit relative to nodes the restarted server
+    // only knows about from the persisted log.
+    const second = startTestServer({ store: new SqliteOpLog(dbPath) });
+    const a2 = makeClient(second.port, "a");
+    await a2.opened;
+    await waitUntil(() => a2.rga.getText() === "hello");
+    a2.send(a2.rga.insertAt(5, " world"));
+    await waitUntil(() => second.doc.getText() === "hello world");
+  });
+
+  it("SqliteOpLog round-trips ops in order and treats a batch atomically", () => {
+    const dbPath = tempDbPath();
+    const log = new SqliteOpLog(dbPath);
+    const rga = new RGA("a");
+    const ops = [...rga.insertAt(0, "ab"), ...rga.deleteAt(0, 1)];
+
+    log.append(ops);
+    log.append([]);
+    log.close();
+
+    const reopened = new SqliteOpLog(dbPath);
+    expect(reopened.load()).toEqual(ops);
+    reopened.close();
+  });
+});

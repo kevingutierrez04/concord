@@ -63,7 +63,7 @@ export class RGA {
   // take, then returns the ops so a caller can broadcast them.
   insertAt(index: number, text: string): InsertOp[] {
     const ops: InsertOp[] = [];
-    let afterId = this.visibleIdBefore(index);
+    let afterId = this.anchorAt(index);
     for (const ch of text) {
       const op: InsertOp = {
         type: "insert",
@@ -194,8 +194,9 @@ export class RGA {
   }
 
   // Id of the visible node immediately before plain-text position `index`,
-  // or null if `index` is 0 (insert at the very start).
-  private visibleIdBefore(index: number): NodeId | null {
+  // or null if `index` is 0 (the very start). Unlike a raw index, this stays
+  // pointing at the same spot in the document as concurrent edits land.
+  anchorAt(index: number): NodeId | null {
     if (index <= 0) return null;
     let seen = 0;
     for (const node of this.nodes) {
@@ -215,6 +216,19 @@ export class RGA {
         return node.deleted ? null : seen;
       }
       if (!node.deleted) seen++;
+    }
+    return null;
+  }
+
+  // Inverse of anchorAt: the plain-text caret position just after `anchor`
+  // (0 for null). A tombstoned anchor resolves to where it used to be.
+  // Returns null if the anchor's insert hasn't been received yet.
+  indexOfAnchor(anchor: NodeId | null): number | null {
+    if (anchor === null) return 0;
+    let seen = 0;
+    for (const node of this.nodes) {
+      if (!node.deleted) seen++;
+      if (idKey(node.id) === idKey(anchor)) return seen;
     }
     return null;
   }
