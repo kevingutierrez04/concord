@@ -16,6 +16,10 @@ export interface DocClientHandlers {
   onRemoteChange: (text: string, previousText: string) => void;
   onConnectedChange: (connected: boolean) => void;
   onPresenceChange?: (users: RemotePresence[]) => void;
+  // Color is always server-assigned; name is server-assigned only if the
+  // client didn't already choose one (see DocClient.setIdentity). Both
+  // arrive together, asynchronously, after the first presence announcement.
+  onIdentityAssigned?: (name: string, color: string) => void;
 }
 
 function opKey(op: Op): string {
@@ -27,8 +31,9 @@ export class DocClient {
   private ws: WebSocket | null = null;
   private stopped = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-  private localName = "anonymous";
-  private localColor = "#888888";
+  // Empty means "I haven't chosen a name" -- the server will generate a
+  // unique one and tell us via the "identity" message.
+  private localName = "";
   private localAnchor: NodeId | null = null;
   private remotePresence = new Map<string, PresenceState>();
 
@@ -64,9 +69,8 @@ export class DocClient {
     }));
   }
 
-  setIdentity(name: string, color: string): void {
+  setIdentity(name: string): void {
     this.localName = name;
-    this.localColor = color;
     this.sendPresence();
   }
 
@@ -135,6 +139,14 @@ export class DocClient {
         this.notifyPresence();
         return;
       }
+      if (message.type === "identity") {
+        // Remember it so a later reconnect (or cursor-move presence ping)
+        // resends the already-assigned name instead of asking to generate
+        // a new one every time.
+        this.localName = message.name;
+        this.handlers.onIdentityAssigned?.(message.name, message.color);
+        return;
+      }
 
       const previousText = this.rga.getText();
 
@@ -180,7 +192,7 @@ export class DocClient {
     this.send({
       type: "presence",
       clientId: this.siteId,
-      state: { name: this.localName, color: this.localColor, anchor: this.localAnchor },
+      state: { name: this.localName, anchor: this.localAnchor },
     });
   }
 

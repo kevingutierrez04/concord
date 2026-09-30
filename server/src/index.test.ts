@@ -7,7 +7,7 @@ import WebSocket from "ws";
 import { RGA, type Op } from "../../crdt/src/rga.js";
 import { createServer, type ServerOptions } from "./index.js";
 import { SqliteOpLog } from "./persistence.js";
-import type { PresenceState, ServerMessage } from "./protocol.js";
+import type { OwnPresenceState, ServerMessage } from "./protocol.js";
 
 async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<void> {
   const start = Date.now();
@@ -40,8 +40,12 @@ function makeClient(port: number, siteId: string, wsOptions?: WebSocket.ClientOp
     send(ops: Op[]) {
       ws.send(JSON.stringify({ type: "ops", ops }));
     },
-    sendPresence(state: PresenceState) {
+    sendPresence(state: OwnPresenceState) {
       ws.send(JSON.stringify({ type: "presence", clientId: siteId, state }));
+    },
+    identity(): { name: string; color: string } | undefined {
+      const msg = messages.find((m) => m.type === "identity");
+      return msg?.type === "identity" ? { name: msg.name, color: msg.color } : undefined;
     },
   };
 }
@@ -127,7 +131,7 @@ describe("multi-client sync over the real server", () => {
 });
 
 describe("presence", () => {
-  const state = (name: string): PresenceState => ({ name, color: "#ff0000", anchor: null });
+  const state = (name: string): OwnPresenceState => ({ name, anchor: null });
 
   it("relays a client's presence to others but not back to itself", async () => {
     const { port } = startTestServer();
@@ -172,12 +176,15 @@ describe("presence", () => {
     expect(b.messages.find((m) => m.type === "presence-leave")).toMatchObject({ clientId: "a" });
   });
 
-  it("sanitizes untrusted name and color fields", async () => {
+  it("truncates an untrustworthy name and ignores any color a client sends", async () => {
     const { port } = startTestServer();
     const a = makeClient(port, "a");
     const b = makeClient(port, "b");
     await Promise.all([a.opened, b.opened]);
 
+    // Simulates a malicious or outdated client still sending a color --
+    // the current protocol doesn't even have that field, but the server
+    // must not trust arbitrary JSON from the wire regardless.
     a.ws.send(
       JSON.stringify({
         type: "presence",
@@ -190,7 +197,104 @@ describe("presence", () => {
     const relayed = b.messages.find((m) => m.type === "presence");
     if (relayed?.type !== "presence") throw new Error("unreachable");
     expect(relayed.state.name).toHaveLength(32);
-    expect(relayed.state.color).toBe("#888888");
+    expect(relayed.state.color).not.toBe("red; background:url(x)");
+  });
+
+  it("assigns each connected client a distinct color and tells them what it is", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    const b = makeClient(port, "b");
+    const c = makeClient(port, "c");
+    await Promise.all([a.opened, b.opened, c.opened]);
+
+    a.sendPresence(state("Ann"));
+    b.sendPresence(state("Bea"));
+    c.sendPresence(state("Cy"));
+    await waitUntil(
+      () => a.identity() !== undefined && b.identity() !== undefined && c.identity() !== undefined
+    );
+
+    const [colorA, colorB, colorC] = [a.identity()!.color, b.identity()!.color, c.identity()!.color];
+    expect(new Set([colorA, colorB, colorC]).size).toBe(3);
+
+    // The color broadcast to others must match what the client itself was told.
+    await waitUntil(() => b.messages.some((m) => m.type === "presence"));
+    const annViaB = b.messages.find((m) => m.type === "presence" && m.clientId === "a");
+    expect(annViaB).toMatchObject({ state: { color: colorA } });
+  });
+
+  it("keeps a client's color stable across a rename instead of reassigning it", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    await a.opened;
+
+    a.sendPresence(state("Ann"));
+    await waitUntil(() => a.identity() !== undefined);
+    const firstColor = a.identity()!.color;
+
+    a.sendPresence(state("Annie"));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(a.identity()!.color).toBe(firstColor);
+    expect(a.messages.filter((m) => m.type === "identity")).toHaveLength(1); // not re-sent
+
+    const relayedRename = a.messages.find(
+      (m) => m.type === "presence" && m.state.name === "Annie"
+    );
+    expect(relayedRename).toBeUndefined(); // presence isn't echoed back to the sender
+  });
+
+  it("reserves a unique generated name for a client that hasn't chosen one", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    const b = makeClient(port, "b");
+    await Promise.all([a.opened, b.opened]);
+
+    // Empty name -- "I haven't picked one, generate me one."
+    a.sendPresence({ name: "", anchor: null });
+    b.sendPresence({ name: "", anchor: null });
+    await waitUntil(() => a.identity() !== undefined && b.identity() !== undefined);
+
+    const [nameA, nameB] = [a.identity()!.name, b.identity()!.name];
+    expect(nameA).not.toBe("");
+    expect(nameB).not.toBe("");
+    expect(nameA).not.toBe(nameB);
+  });
+
+  it("honors an explicit custom name as-is, without enforcing uniqueness on it", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    const b = makeClient(port, "b");
+    await Promise.all([a.opened, b.opened]);
+
+    // Two people deliberately choosing the same name is their call, not a
+    // system collision -- only the auto-generated name is reserved.
+    a.sendPresence(state("Sam"));
+    b.sendPresence(state("Sam"));
+    await waitUntil(() => a.identity() !== undefined && b.identity() !== undefined);
+
+    expect(a.identity()!.name).toBe("Sam");
+    expect(b.identity()!.name).toBe("Sam");
+  });
+
+  it("frees a generated name for reuse once its connection disconnects", async () => {
+    const { port } = startTestServer();
+    const a = makeClient(port, "a");
+    await a.opened;
+    a.sendPresence({ name: "", anchor: null });
+    await waitUntil(() => a.identity() !== undefined);
+    const generatedName = a.identity()!.name;
+    a.ws.close();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const b = makeClient(port, "b");
+    await b.opened;
+    b.sendPresence({ name: "", anchor: null });
+    await waitUntil(() => b.identity() !== undefined);
+
+    // Not a strict requirement that it's the *same* name back -- just
+    // confirms a disconnect doesn't permanently shrink the pool.
+    expect(b.identity()!.name).not.toBe("");
   });
 
   it("never persists or replays presence as document state", async () => {

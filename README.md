@@ -1,6 +1,6 @@
 # concord
 
-A simplified real-time collaborative text editor. Multiple people edit one document at the same time, see each other's cursors, survive disconnects without losing work, and never need a "who wins" merge — conflicts are resolved by a sequence CRDT (an RGA) that I implemented from scratch rather than pulling in Yjs or Automerge.
+A simplified real-time collaborative text editor. Multiple people edit one document at the same time, see each other's cursors, survive disconnects without losing work, and never need a "who wins" merge — conflicts are resolved by a sequence CRDT (an RGA). 
 
 - **Real-time sync** over WebSockets, operation-based
 - **Conflict-free merging** of concurrent, out-of-order, and duplicated edits
@@ -29,10 +29,6 @@ crdt/      The RGA implementation and its tests. Plain TypeScript with no
 ```
 
 Every participant — each browser tab and the server — holds a full replica of the document as an RGA. Edits become small operations that are applied locally first (so typing never waits on the network), sent to the server, and relayed to everyone else. Because the RGA merge is deterministic, every replica ends up identical no matter what order operations arrive in.
-
-**Why split instead of a Next.js custom server:**
-keeping the frontend as a stock Next.js app preserves Vercel as a deploy target and keeps frontend/
-backend concerns and lifecycles independent — closer to how a real client-server collaborative system is structured.
 
 **Why `ws` over Socket.IO:** Socket.IO layers reconnection, rooms, and fallback transports on top of raw WebSockets.
 Reconnection/resync and the multi-client sync protocol are things I wanted to build so the backend uses the bare
@@ -70,16 +66,6 @@ Edits are applied locally regardless of connection state. On every (re)connect t
 
 ## Testing
 
-Concurrency is the hard part of this project, so it's tested at three levels:
-
-| Suite | What it proves |
-| --- | --- |
-| `crdt/` | The algorithm in isolation, including a property-based test (`fast-check`, 100 random runs) that generates random concurrent edits across 3 replicas, delivers them in random order, and asserts every replica converges. |
-| `server/` | Real `ws` clients against a real in-process server: concurrent inserts/deletes converge, late joiners bootstrap, ops aren't echoed to senders, presence relays/sanitizes/expires, dead peers are reaped, and the document survives a restart. |
-| `concord/` | The client's reconnect, reconcile, and presence logic against a fake socket with fake timers — including ops lost mid-flight and deletes the server missed. |
-
-I also drove the running app with a headless browser (Playwright, not committed): two tabs typing simultaneously, remote caret rendering, a server kill mid-edit with both tabs editing offline, then restart — everything converged with no lost characters.
-
 ```bash
 cd crdt    && npm test
 cd server  && npm test
@@ -104,11 +90,6 @@ npm run dev         # Next.js on http://localhost:3000
 
 Open `http://localhost:3000` in two browser tabs (each tab gets its own ephemeral client id and generated name) to see edits and cursors sync between them. Server settings: `PORT` (default 4001), `DB_PATH` (default `concord.db`). Frontend: `NEXT_PUBLIC_WS_URL` (default `ws://localhost:4001`), see `concord/.env.local.example`.
 
-## Deploying
-
-- **Server** — needs a host that supports long-lived WebSocket connections **and a persistent disk** for the SQLite file. A `Dockerfile` is at the repo root; build from the repo root (the server imports `../crdt`): `docker build -t concord-server .`, and mount a volume at `/data`.
-- **Frontend** — a standard Next.js app (Vercel works). Set `NEXT_PUBLIC_WS_URL` to the server's `wss://` URL. Because it imports `../crdt`, enable "include source files outside the root directory" if your host builds from `concord/` only.
-
 ## Known limitations and what I'd do with more time
 
 - **Tombstones are never collected**, so memory and snapshot size grow with edit history. Fix: track causal stability (vector clocks) and compact once every replica has seen a delete.
@@ -118,4 +99,5 @@ Open `http://localhost:3000` in two browser tabs (each tab gets its own ephemera
 - **O(n) position lookups** in the RGA; a balanced tree or skip list over nodes would make edits O(log n).
 - **Fixed reconnect delay** rather than exponential backoff with jitter.
 - **One document, no auth** — by design, to keep scope on the CRDT.
-- **The Dockerfile hasn't been built** in the environment I developed in (no Docker daemon there), and nothing is deployed yet.
+- **Only the auto-generated display name is collision-free.** An explicit rename isn't deduped against other participants — a deliberate design scope, not an oversight.
+- **Nothing is deployed yet.**

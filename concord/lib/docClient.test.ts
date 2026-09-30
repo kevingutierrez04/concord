@@ -51,6 +51,8 @@ function sentPresence(ws: FakeWebSocket) {
 function makeHandlers() {
   const events: string[] = [];
   let presences: RemotePresence[] = [];
+  let myColor: string | undefined;
+  let myName: string | undefined;
   const handlers: DocClientHandlers = {
     onLocalChange: (text) => events.push(`local:${text}`),
     onRemoteChange: (text) => events.push(`remote:${text}`),
@@ -58,8 +60,18 @@ function makeHandlers() {
     onPresenceChange: (users) => {
       presences = users;
     },
+    onIdentityAssigned: (name, color) => {
+      myName = name;
+      myColor = color;
+    },
   };
-  return { handlers, events, getPresences: () => presences };
+  return {
+    handlers,
+    events,
+    getPresences: () => presences,
+    getMyColor: () => myColor,
+    getMyName: () => myName,
+  };
 }
 
 beforeEach(() => {
@@ -324,7 +336,7 @@ describe("DocClient presence", () => {
     const ws1 = FakeWebSocket.instances[0];
     ws1.open();
     ws1.receive({ type: "snapshot", ops: [] });
-    client.setIdentity("Ann", "#00ff00");
+    client.setIdentity("Ann");
     client.edit("hi");
     client.setCursor(1);
 
@@ -341,5 +353,59 @@ describe("DocClient presence", () => {
     const announced = sentPresence(ws2);
     expect(announced).toHaveLength(1);
     expect((announced[0] as { state: { name: string } }).state.name).toBe("Ann");
+  });
+
+  it("never sends a color -- the server assigns one, delivered via an 'identity' message", () => {
+    const { handlers, getMyColor } = makeHandlers();
+    const client = new DocClient("a", () => new FakeWebSocket() as unknown as WebSocket, handlers);
+    client.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    ws.receive({ type: "snapshot", ops: [] });
+    client.setIdentity("Ann");
+
+    const sent = sentPresence(ws).at(-1) as { state: Record<string, unknown> };
+    expect(sent.state).not.toHaveProperty("color");
+    expect(getMyColor()).toBeUndefined();
+
+    ws.receive({ type: "identity", name: "Ann", color: "#4363d8" });
+    expect(getMyColor()).toBe("#4363d8");
+  });
+
+  it("asks the server to generate a name when setIdentity is called with none", () => {
+    const { handlers, getMyName } = makeHandlers();
+    const client = new DocClient("a", () => new FakeWebSocket() as unknown as WebSocket, handlers);
+    client.start();
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    ws.receive({ type: "snapshot", ops: [] });
+    client.setIdentity(""); // no stored name yet -- ask the server for one
+
+    const sent = sentPresence(ws).at(-1) as { state: { name: string } };
+    expect(sent.state.name).toBe("");
+    expect(getMyName()).toBeUndefined();
+
+    ws.receive({ type: "identity", name: "Swift Otter", color: "#4363d8" });
+    expect(getMyName()).toBe("Swift Otter");
+  });
+
+  it("remembers a server-generated name so a reconnect doesn't ask to generate a new one", () => {
+    const { handlers } = makeHandlers();
+    const client = new DocClient("a", () => new FakeWebSocket() as unknown as WebSocket, handlers);
+    client.start();
+    const ws1 = FakeWebSocket.instances[0];
+    ws1.open();
+    ws1.receive({ type: "snapshot", ops: [] });
+    client.setIdentity("");
+    ws1.receive({ type: "identity", name: "Swift Otter", color: "#4363d8" });
+
+    ws1.close();
+    vi.advanceTimersByTime(1000);
+    const ws2 = FakeWebSocket.instances[1];
+    ws2.open();
+    ws2.receive({ type: "snapshot", ops: [] });
+
+    const sent = sentPresence(ws2).at(-1) as { state: { name: string } };
+    expect(sent.state.name).toBe("Swift Otter"); // not "" again
   });
 });

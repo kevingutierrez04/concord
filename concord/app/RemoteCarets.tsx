@@ -2,8 +2,9 @@ import type { Ref } from "react";
 import type { RemotePresence } from "@/lib/docClient";
 
 // Shared by the textarea and the overlay so both wrap text identically.
+// leading-7 (28px) <-> the caret bar's h-7 below must stay in sync.
 export const EDITOR_TEXT_CLASSES =
-  "p-4 font-mono text-sm leading-6 whitespace-pre-wrap break-words [scrollbar-gutter:stable] border";
+  "p-6 font-sans text-base leading-7 whitespace-pre-wrap break-words [scrollbar-gutter:stable] border";
 
 interface Props {
   text: string;
@@ -28,11 +29,11 @@ export function RemoteCarets({ text, users, mirrorRef }: Props) {
       <span
         key={caret.clientId}
         data-testid="remote-caret"
-        className="pointer-events-none relative inline-block h-6 w-0 align-bottom"
+        className="pointer-events-none relative inline-block h-7 w-0 align-bottom"
         style={{ borderLeft: `2px solid ${caret.color}` }}
       >
         <span
-          className="absolute -top-3.5 left-0 whitespace-nowrap rounded px-1 text-[10px] leading-3 text-white"
+          className="absolute -top-4 left-0 whitespace-nowrap rounded-full px-1.5 py-px text-[10px] font-medium leading-3 text-white shadow-sm"
           style={{ backgroundColor: caret.color }}
         >
           {caret.name}

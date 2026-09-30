@@ -1,20 +1,19 @@
 "use client";
 
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { DocClient, type RemotePresence } from "./docClient";
-import { colorFor, randomName } from "./identity";
 import { computeTextDiff } from "./textDiff";
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:4001";
 const CLIENT_ID_KEY = "concord-client-id";
 const NAME_KEY = "concord-display-name";
+
+// Shown for the instant between connecting and the server's "identity"
+// message arriving -- name and color are both server-assigned (see
+// server/src/presence.ts), so neither can be known any earlier than that
+// round trip. Both start blank/neutral, matching the server-rendered HTML,
+// so there's nothing to reconcile on hydration.
+const PENDING_COLOR = "#9ca3af";
 
 function getClientId(): string {
   if (typeof window === "undefined") return "server";
@@ -23,44 +22,6 @@ function getClientId(): string {
   const id = crypto.randomUUID();
   window.sessionStorage.setItem(CLIENT_ID_KEY, id);
   return id;
-}
-
-function getStoredName(): string {
-  const existing = window.sessionStorage.getItem(NAME_KEY);
-  if (existing !== null) return existing;
-  const name = randomName();
-  window.sessionStorage.setItem(NAME_KEY, name);
-  return name;
-}
-
-interface Identity {
-  name: string;
-  color: string;
-}
-
-// The display name lives in sessionStorage, an external store, so it is read
-// with useSyncExternalStore: the server render gets a blank identity and the
-// client swaps in the stored one after hydration without a mismatch.
-const SERVER_IDENTITY: Identity = { name: "", color: "#888888" };
-const identityListeners = new Set<() => void>();
-let cachedIdentity = SERVER_IDENTITY;
-
-function subscribeIdentity(listener: () => void): () => void {
-  identityListeners.add(listener);
-  return () => identityListeners.delete(listener);
-}
-
-function getIdentitySnapshot(): Identity {
-  const name = getStoredName();
-  const color = colorFor(getClientId());
-  if (cachedIdentity.name !== name || cachedIdentity.color !== color) {
-    cachedIdentity = { name, color };
-  }
-  return cachedIdentity;
-}
-
-function getServerIdentitySnapshot(): Identity {
-  return SERVER_IDENTITY;
 }
 
 interface CursorRange {
@@ -72,11 +33,8 @@ export function useDocSocket() {
   const [content, setContent] = useState("");
   const [connected, setConnected] = useState(false);
   const [presences, setPresences] = useState<RemotePresence[]>([]);
-  const me = useSyncExternalStore(
-    subscribeIdentity,
-    getIdentitySnapshot,
-    getServerIdentitySnapshot
-  );
+  const [myColor, setMyColor] = useState(PENDING_COLOR);
+  const [myName, setMyName] = useState("");
   const clientRef = useRef<DocClient | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const pendingCursorRef = useRef<CursorRange | null>(null);
@@ -87,6 +45,11 @@ export function useDocSocket() {
       onLocalChange: (text) => setContent(text),
       onConnectedChange: (isConnected) => setConnected(isConnected),
       onPresenceChange: (users) => setPresences(users),
+      onIdentityAssigned: (assignedName, color) => {
+        setMyName(assignedName);
+        setMyColor(color);
+        window.sessionStorage.setItem(NAME_KEY, assignedName);
+      },
       onRemoteChange: (text, previousText) => {
         const textarea = textareaRef.current;
         if (textarea) {
@@ -104,8 +67,13 @@ export function useDocSocket() {
     });
     clientRef.current = client;
 
-    const identity = getIdentitySnapshot();
-    client.setIdentity(identity.name.trim() || "anonymous", identity.color);
+    // An empty name tells the server "generate a unique one for me" (see
+    // PresenceNames in server/src/presence.ts); a name already stored from
+    // an earlier connection in this tab is sent as-is and just gets echoed
+    // back via the same "identity" round trip, not regenerated. Either way
+    // `myName` stays at its blank initial value (matching the server
+    // render) until that reply lands -- same pattern as `myColor`.
+    client.setIdentity(window.sessionStorage.getItem(NAME_KEY) ?? "");
 
     client.start();
 
@@ -130,15 +98,31 @@ export function useDocSocket() {
     clientRef.current?.edit(next);
   }, []);
 
-  const setName = useCallback((name: string) => {
-    window.sessionStorage.setItem(NAME_KEY, name);
-    identityListeners.forEach((listener) => listener());
-    clientRef.current?.setIdentity(name.trim() || "anonymous", colorFor(getClientId()));
+  const setName = useCallback((nextName: string) => {
+    setMyName(nextName); // always reflect what's typed, so the input stays controlled
+    // An empty string sent to the server means "generate one for me" (see
+    // DocClient.setIdentity) -- while the user is mid-edit (e.g. selected
+    // all and deleted before typing a replacement), that would make a
+    // fresh random name appear out from under them. Hold off sending until
+    // there's real content; everyone else keeps seeing the last name you
+    // had until then.
+    if (nextName.trim().length === 0) return;
+    window.sessionStorage.setItem(NAME_KEY, nextName);
+    clientRef.current?.setIdentity(nextName);
   }, []);
 
   const reportCursor = useCallback((index: number) => {
     clientRef.current?.setCursor(index);
   }, []);
 
-  return { content, edit, connected, textareaRef, presences, me, setName, reportCursor };
+  return {
+    content,
+    edit,
+    connected,
+    textareaRef,
+    presences,
+    me: { name: myName, color: myColor },
+    setName,
+    reportCursor,
+  };
 }

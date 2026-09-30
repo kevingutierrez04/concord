@@ -1,26 +1,12 @@
 import { WebSocketServer, type WebSocket } from "ws";
 import { RGA } from "../../crdt/src/rga.js";
 import { SqliteOpLog, type OpLog } from "./persistence.js";
-import type {
-  ClientMessage,
-  PresenceEntry,
-  PresenceState,
-  ServerMessage,
-} from "./protocol.js";
+import { PresenceColors, PresenceNames, sanitizeName } from "./presence.js";
+import type { ClientMessage, PresenceEntry, ServerMessage } from "./protocol.js";
 
 export interface ServerOptions {
   store?: OpLog;
   heartbeatMs?: number;
-}
-
-const DEFAULT_COLOR = "#888888";
-
-function sanitizePresence(state: PresenceState): PresenceState {
-  return {
-    name: String(state.name ?? "").slice(0, 32) || "anonymous",
-    color: /^#[0-9a-f]{6}$/i.test(state.color) ? state.color : DEFAULT_COLOR,
-    anchor: state.anchor,
-  };
 }
 
 export function createServer(port: number, options: ServerOptions = {}) {
@@ -34,6 +20,8 @@ export function createServer(port: number, options: ServerOptions = {}) {
   const wss = new WebSocketServer({ port });
   const clients = new Set<WebSocket>();
   const presence = new Map<WebSocket, PresenceEntry>();
+  const colors = new PresenceColors();
+  const names = new PresenceNames();
   const alive = new WeakMap<WebSocket, boolean>();
 
   function send(ws: WebSocket, message: ServerMessage) {
@@ -71,7 +59,16 @@ export function createServer(port: number, options: ServerOptions = {}) {
         store?.append(message.ops);
         broadcast({ type: "ops", ops: message.ops }, ws);
       } else if (message.type === "presence" && message.state) {
-        const state = sanitizePresence(message.state);
+        // Must be read before presence.set() below, and before either
+        // pool is touched -- it's the signal for "this connection hasn't
+        // been assigned anything yet."
+        const isFirstContact = !presence.has(ws);
+
+        const { color } = colors.ensure(ws);
+        const name = names.resolve(ws, sanitizeName(message.state.name));
+        if (isFirstContact) send(ws, { type: "identity", name, color });
+
+        const state = { name, color, anchor: message.state.anchor ?? null };
         presence.set(ws, { clientId: String(message.clientId), state });
         broadcast({ type: "presence", clientId: String(message.clientId), state }, ws);
       }
@@ -79,6 +76,8 @@ export function createServer(port: number, options: ServerOptions = {}) {
 
     ws.on("close", () => {
       clients.delete(ws);
+      colors.release(ws);
+      names.release(ws);
       const entry = presence.get(ws);
       if (entry) {
         presence.delete(ws);

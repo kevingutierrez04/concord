@@ -18,6 +18,8 @@ npm-debug.log*
 .vercel
 
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 
